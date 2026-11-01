@@ -18,6 +18,25 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Every temp dir and file this run creates (by the tests via os.tmpdir(), and by the spawned
+// script via mktemp, which honours TMPDIR) goes under ONE per-run root, removed on exit, so a
+// run leaves nothing behind in the system temp dir. Read-only fixtures are made writable first.
+const RUN_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'cct-run-'));
+process.env.TMPDIR = RUN_TMP; process.env.TMP = RUN_TMP; process.env.TEMP = RUN_TMP;
+function rmTree(p) {
+  let st; try { st = fs.lstatSync(p); } catch (e) { return; }
+  if (st.isDirectory()) {
+    try { fs.chmodSync(p, 0o700); } catch (e) {}
+    let names = []; try { names = fs.readdirSync(p); } catch (e) {}
+    names.forEach(function (n) { rmTree(path.join(p, n)); });
+    try { fs.rmdirSync(p); } catch (e) {}
+  } else { try { fs.unlinkSync(p); } catch (e) {} }
+}
+process.on('exit', function () { rmTree(RUN_TMP); });
+// An interrupted run (Ctrl-C, a timeout) still goes through the exit hook above.
+process.on('SIGINT', function () { process.exit(130); });
+process.on('SIGTERM', function () { process.exit(143); });
+
 const ROOT = path.join(__dirname, '..');
 const ENTRY = path.join(ROOT, 'bin', 'cct-statusline');   // the pure-shell entry
 const READER = path.join(ROOT, 'bin', 'telemetry.js');    // the on-demand CLI reader
@@ -3051,6 +3070,20 @@ if (IS_WIN) { skipTest('R11 rigor block', 'POSIX only (/bin/sh, PATH shims)'); }
     assert.strictEqual(rl(d, 'Y').split('|')[0], String(Date.parse(iso) / 1000));
   });
 })();
+
+
+test('an UNWRITABLE telemetry dir falls back to a system temp file, which is removed after the render', function () {
+  if (IS_WIN) { skipTest('unwritable dir fallback', 'POSIX permissions'); return; }
+  const dir = tmpDir(); fs.chmodSync(dir, 0o555);
+  try {
+    let writable = true; try { fs.writeFileSync(path.join(dir, 'p'), 'x'); fs.unlinkSync(path.join(dir, 'p')); } catch (e) { writable = false; }
+    if (writable) { skipTest('unwritable dir fallback', 'running as root'); return; }
+    const before = fs.readdirSync(os.tmpdir()).length;
+    const r = runEntry(ctxOnly(7), { CCT_DIR: dir, CCT_NOW: String(AW_NOW) });
+    assert.strictEqual(r.stdout, 'ctx 7%', 'still renders');
+    assert.strictEqual(fs.readdirSync(os.tmpdir()).length, before, 'no temp left in TMPDIR');
+  } finally { fs.chmodSync(dir, 0o755); }
+});
 
 console.log('\n' + pass + '/' + (pass + fail) + ' passed' +
   (skip ? ' (' + skip + ' skipped: ' + (IS_WIN ? 'Windows' : process.platform) + ')' : ''));
