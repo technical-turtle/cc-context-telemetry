@@ -86,69 +86,52 @@ fi
 #
 # 5h/7d are ACCOUNT-WIDE. Claude Code refreshes rate_limits only when a session makes an API
 # call, so different open sessions disagree: a session that has not called recently keeps
-# reporting its OLD reading. The picker below ranks the readings per window (see consider()),
-# among those whose own reset is still in the FUTURE:
-#   5h: (resets_at DESC, then used_percentage DESC)
-#   7d: (resets_at DESC, then the reading OWN five_hour resets_at DESC as a CLOCK, then
-#        used_percentage DESC)
+# reporting its OLD reading. Each session therefore keeps a tracker (telemetry-rl2-<sid>) that
+# records, per window, WHEN its reading was measured, and the picker (see consider()) takes, per
+# window, among readings whose reset is still in the FUTURE:
+#   (resets_at DESC, then measurement time DESC)
+# i.e. the newest window, and in it the most recently measured reading. Usage percentages are
+# never compared: after a quota reset the newest reading is the LOWER one and it must win, and
+# within a window the most recent reading is right whatever its number. (Earlier versions
+# ranked by usage or dated readings by the 5h window; both showed stale numbers after a
+# mid-window reset, on 2026-09-05 and again on plans without a 5-hour limit.)
 #
-# WHY. Both windows are FIXED-window quotas (verified against live payloads: 7d resets_at sits
-# on a 604800s grid and every concurrent session shares the identical current boundary), so a
-# LATER resets_at is always the newer window and a pre-reset high carries an OLD boundary that
-# has since ELAPSED and is excluded by consider() (r <= now). That handles a NORMAL reset.
+# The measurement time:
+#   - For a session this script has seen before: the moment its reading CHANGED. A reading
+#     changes only when an API response refreshes it (including responses to the session
+#     subagents), so the change moment is when it was measured, and an idle session keeps its
+#     old stamp. An unchanged reading keeps its stamp even if a request was made (a cancelled
+#     request returns no new numbers). A session is never handed an old value as a change:
+#     live data shows a resumed session carries no rate_limits until its first request, and a
+#     new session carrying its process cached numbers is a first sighting (below).
+#   - A session that renders BEFORE its first request (older Claude Code shows no rate_limits
+#     then) gets an empty marker tracker, so its first reading is a change, stamped when it
+#     appears: a fresh measurement.
+#   - For a FIRST sighting (no tracker yet: a fresh install, a session idle since before its
+#     tracker existed, a recreated tracker), the change moment is unknown. Newer Claude Code
+#     (2.1.280+) exposes the session last main-thread API request as prompt_cache.expires_at and
+#     .ttl (each request refreshes the cache, so expires_at - ttl is when it was sent): that is
+#     the stamp, so an idle session carries its real, old time. Verified on the live pool
+#     (2026-11-01): in all 34 payloads that carry it, it is never later than the render that
+#     showed it, and idle sessions carry times hours to days old. Older Claude Code has no
+#     prompt_cache: then the time of the last assistant entry in the tail of the session
+#     transcript (transcript_path) is the stamp, read once on the first sighting only. Without
+#     either (no request yet, no transcript) the time is UNKNOWN and the stamp is 0, so the
+#     reading ranks below every reading with a known time until it changes.
+#   - A stored stamp that is not a plain number, has 12+ digits, or lies more than 60s in the
+#     future (a corrupt tracker, a clock step) is treated as a first sighting and replaced.
+#   - So a reading is stamped "now" only when this session just measured it: never on a first
+#     sighting, never for a value received without a request, and a deleted tracker cannot make
+#     an old reading look new. The reader prune (index.js) still keeps a tracker until every
+#     reset boundary in it has elapsed, and a reading whose boundary elapsed is excluded here,
+#     so an ancient payload cannot win.
+# All stamps come from this machine clock. On the live pool (2026-11-01, 150 trackers over 17
+# weekly windows), ordered by stamp, 7d usage only went DOWN at the 2026-09-05 reset (correct,
+# the newer reading) and at one re-rendered ancient payload whose window had already elapsed
+# (excluded).
 #
-# But used_percentage DESC is NOT a safe freshness order on its own. It assumes account usage
-# only ever GROWS within one boundary, and that assumption is FALSE in production: on 2026-09-05
-# the 7d quota was reset WITHOUT the weekly boundary moving (same resets_at 1788811200: one
-# session payload still reported 48%, live sessions reported 2% then 8%). "Highest used% wins"
-# then locks the bar onto the STALEST pre-reset reading for the rest of the week, because a 7d
-# boundary stays in the future for days and the elapsed-exclusion above never fires.
-#
-# So DATE each 7d reading instead of trusting its magnitude. A tracker line is written from ONE
-# payload per render, so its 5h pair and its 7d pair ALWAYS come from the SAME API response, and
-# the 5h reset epoch therefore timestamps the WHOLE line:
-#   - five_hour resets_at never moves backwards, and successive 5h windows are at least 5h apart
-#     (verified 2026-09-05 over 76 days of live pool data: every gap between consecutive distinct
-#     boundaries is >= 18000s, the smallest exactly 18000s). A reading with boundary R was
-#     measured in (R - 5h, R], so those intervals cannot overlap and a LATER 5h boundary means a
-#     STRICTLY LATER measurement.
-#   - it is ACCOUNT-WIDE, not per session (same data: a single boundary is carried identically by
-#     up to 3 concurrent sessions, and no two readings have overlapping measurement intervals - a
-#     per-session window would produce both). If it were per session this ordering would be
-#     meaningless. Single account, single machine: that is the evidence available here, not a
-#     guarantee about every account. Counts grow as sessions render, so they are not restated.
-#   - a reading whose 5h boundary already elapsed is therefore KNOWN to predate one whose 5h
-#     boundary is still ahead. Whenever any session holds a current-window reading, that bounds
-#     7d staleness to the current 5h window instead of a whole 7d window; when the account has
-#     been idle past its boundary, every reading is elapsed-dated and the clock still orders
-#     them, so the freshest one that exists wins.
-# Only when two readings carry the SAME 5h clock does used% decide, which preserves the
-# 24%-vs-96% behaviour (a stale-low 7d must not beat the true high). KNOWN RESIDUAL: two readings
-# that straddle a mid-window reset INSIDE one 5h window are indistinguishable here, so the
-# stale-high one wins until some session records a reading in a LATER 5h window. Under continued
-# use that is at most ~5h, but it takes an API call, so while every session sits idle the two
-# clocks elapse together, the order never changes, and the stale high can hold for the rest of
-# the 7d window - the same bound as before this rule (which is the honest statement: inside one
-# 5h window this rule is no worse and no better). Ranking those by 5h used% would separate them,
-# but only by assuming 5h usage never drops mid-window - the exact assumption this comment
-# documents as falsified for 7d - and it would then invert the pick whenever a 5h quota is reset
-# mid-window. Not worth it.
-# PRECONDITION: the dating works because live payloads carry five_hour alongside seven_day
-# (verified 2026-09-05 over every parseable raw payload on this machine: each carries BOTH
-# windows or NEITHER, none carries one without the other, and no five_hour lacks a numeric
-# resets_at). A reading with no/implausible/beyond-horizon 5h reset is UNDATED, ranks below every
-# dated reading, and if NO reading in the pool is dated the 7d rank degrades to the plain used%
-# order above. The one case where that is WORSE than the old order: if the FRESHEST reading were
-# the undated one it would lose to a stale dated one and the bar would UNDERSTATE the quota. That
-# needs a payload with seven_day but no usable five_hour, which has never been observed here; it
-# is pinned by a test rather than guarded, because a separate candidate track for undated lines
-# would add state to the one code path that has caused every regression in this picker.
-#
-# A per-session tracker file (telemetry-rl-<sid>) still records WHEN each window last CHANGED,
-# but that change-TS is NOT a ranking key: an actively-used session whose Claude Code payload is
-# stale restamps a fresh TS onto an OLD reading, so "newest change-TS wins" let a stale-low
-# reading win the account-wide pick (the 24%-vs-96% bug). The TS is kept only as a corruption
-# guard (a FUTURE stamp drops the entry).
+# A stamp more than 60s in the future (corrupt tracker, clock jump) drops the entry from the
+# pick, and the owning session heals it on its next render (see PHASE 2).
 #
 # now comes from CCT_NOW when set (a deterministic test seam, unused in production) else
 # `date +%s`; countdown is a pure DURATION so no timezone math. now must be valid for the
@@ -161,16 +144,30 @@ case "$now" in ""|*[!0-9]*) now="" ;; esac
 # ignored; unset or empty falls back to the default. This is the only knob for the layout.
 segs="${CCT_SEGMENTS:-ctx,5h,7d,model}"
 
-# PHASE 1: extract THIS render's rate_limit reading as "5U|5R|7U|7R" (raw used_percentage +
-# reset epoch for five_hour|seven_day, empty string for an absent field), reusing the SAME
+# PHASE 1: extract THIS render's rate_limit reading as "5U|5R|7U|7R|LC" (raw used_percentage +
+# reset epoch for five_hour|seven_day, empty string for an absent field, then LC = the epoch of
+# this session last API request when the payload exposes it, else empty), reusing the SAME
 # objspan/up/resetsat parse the segment awk uses. One awk over just this payload.
 cur="$(LC_ALL=C awk '
-  function objspan(key,   p, i, n, depth, start, c) {
-    p = index(J, "\"" key "\"")
-    if (p == 0) return ""
-    n = length(J); i = p
-    while (i <= n && substr(J, i, 1) != "{") i++
-    if (i > n) return ""
+  function objspan(key,   p, i, n, depth, start, c, off) {
+    # Find the first occurrence of the quoted key that IS a key (followed, after JSON whitespace,
+    # by a colon), skipping the same text used as a string VALUE (e.g. a session name). Then the
+    # value must BE an object: a null, number or string value (e.g. "five_hour": null) returns ""
+    # instead of scanning ahead into the NEXT object and reading the fields of a sibling as its
+    # own. Whitespace is space, tab and CR (LF never reaches J: awk joins the records without it),
+    # so CRLF or pretty-printed payloads parse; up(), resetsat() and modelid() allow the same.
+    n = length(J); off = 0
+    while (1) {
+      p = index(substr(J, off + 1), "\"" key "\"")
+      if (p == 0) return ""
+      p += off; i = p + length(key) + 2
+      while (i <= n && index(" \t\r", substr(J, i, 1)) > 0) i++
+      if (i <= n && substr(J, i, 1) == ":") break
+      off = p
+    }
+    i++
+    while (i <= n && index(" \t\r", substr(J, i, 1)) > 0) i++
+    if (i > n || substr(J, i, 1) != "{") return ""
     start = i; depth = 0
     while (i <= n) {
       c = substr(J, i, 1)
@@ -184,40 +181,83 @@ cur="$(LC_ALL=C awk '
     t = objspan(key)
     if (t == "") return ""
     gsub(/\{[^{}]*\}/, "", t)
-    if (match(t, /"used_percentage"[ \t]*:[ \t]*[0-9]+(\.[0-9]+)?/) == 0) return ""
-    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
+    if (match(t, /"used_percentage"[ \t\r]*:[ \t\r]*[0-9]+(\.[0-9]+)?/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t\r]*/, "", t); return t
   }
   function resetsat(key,   t) {
     t = objspan(key)
     if (t == "") return ""
     gsub(/\{[^{}]*\}/, "", t)
-    if (match(t, /"resets_at"[ \t]*:[ \t]*[0-9]+/) == 0) return ""
-    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
+    if (match(t, /"resets_at"[ \t\r]*:[ \t\r]*[0-9]+/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t\r]*/, "", t); return t
   }
   { J = J $0 }
-  END { printf "%s|%s|%s|%s", up("five_hour"), resetsat("five_hour"), up("seven_day"), resetsat("seven_day") }
+  # The time of this session last API request, from prompt_cache (Claude Code 2.1.280+): each
+  # request refreshes the prompt cache, so expires_at - ttl is when the last request was made,
+  # i.e. when the rate_limits in this payload were measured. "" when the block, either field,
+  # or a sane value is missing (older Claude Code, or no request yet).
+  function lastcall(   t, e, d, n, u) {
+    t = objspan("prompt_cache")
+    if (t == "") return ""
+    gsub(/\{[^{}]*\}/, "", t)
+    if (match(t, /"expires_at"[ \t\r]*:[ \t\r]*[0-9]+/) == 0) return ""
+    e = substr(t, RSTART, RLENGTH); sub(/.*:[ \t\r]*/, "", e)
+    if (match(t, /"ttl"[ \t\r]*:[ \t\r]*"[0-9]+[smh]"/) == 0) return ""
+    d = substr(t, RSTART, RLENGTH); sub(/.*:[ \t\r]*"/, "", d); sub(/"$/, "", d)
+    u = substr(d, length(d), 1); n = substr(d, 1, length(d) - 1) + 0
+    n = (u == "h") ? n * 3600 : (u == "m") ? n * 60 : n
+    if (n <= 0 || e + 0 < 1000000000 || e + 0 >= 100000000000) return ""
+    if (e - n < 1000000000) return ""
+    return sprintf("%.0f", e - n)
+  }
+  END { printf "%s|%s|%s|%s|%s", up("five_hour"), resetsat("five_hour"), up("seven_day"), resetsat("seven_day"), lastcall() }
 ' "$tmp" 2>/dev/null)"
 
 # PHASE 2: update THIS session's change tracker BEFORE the picker scans, so the current
 # reading is represented. The tracker is a single line "TS5|5U|5R|TS7|7U|7R" with a SEPARATE
-# change timestamp PER WINDOW: rate_limits change only on an API call, and the two windows can
-# change independently, so each window keeps its OWN "last changed" stamp. Stamp TS5/TS7 = now
-# ONLY for the window whose reading actually differs from what we stored (a byte-identical
-# window KEEPS its old TS - it did not change); the untouched window's TS is preserved verbatim.
+# measurement timestamp PER WINDOW: rate_limits change only on an API response, and the two
+# windows can change independently, so each window keeps its OWN "last changed" stamp: TS5/TS7
+# = now ONLY for the window whose reading actually differs from what we stored (a byte-identical
+# window KEEPS its old TS); the untouched window's TS is preserved verbatim. A first sighting
+# is stamped LC (the last-call time) when the payload has it, else the transcript time, else 0.
+# The line is rewritten only when a value changes (or a stamp is healed), so an unchanged
+# render writes nothing.
 # A shared single TS was a bug: 5h churn would restamp the whole line and make a STALE 7d in
 # that same line look freshest, letting it win the account-wide pick with a stale countdown.
 # No rate_limits at all (cur == "|||") or an empty extraction: nothing to track. Requires a
 # valid now. Atomic write (temp in the same dir + mv), the same pattern as the raw write; the
 # "." prefix + $$ keeps concurrent renders from clobbering and keeps the temp out of the picker
-# glob (no dotfiles). MIGRATION: an old 5-field line "TS|5U|5R|7U|7R" is read as 6 fields (p6
-# empty), so its stored 7d pair mismatches this render's and the line is rewritten in the new
-# format on the next render; in the interim the picker parses its a[4..6] as a bogus 7d that
-# consider() rejects (empty resets_at), so an old-format stale 7d can never win.
-rl_final="$dir/telemetry-rl-$sid"
+# glob (no dotfiles).
+# The tracker file is versioned (telemetry-rl2-*): earlier versions (telemetry-rl-*) stamped a
+# first sighting "now" and could restamp an old reading after an age prune, so their stamps are
+# not measurement times. 1.4.8 never reads them (a session is first-sighted afresh, with its
+# real last-call time where Claude Code exposes it); the reader prune removes them.
+rl_final="$dir/telemetry-rl2-$sid"
+# Split off LC (the last field) first, so the window fields below are "5U|5R|7U|7R".
+lc="${cur##*|}"; cur="${cur%|*}"
+case "$lc" in ""|*[!0-9]*) lc="" ;; esac
+# A call cannot have happened after now: a later LC (clock skew, a corrupt value) is not a
+# measurement time and is dropped (the reading is then of unknown time, stamp 0).
+if [ -n "$lc" ] && [ -n "$now" ] && [ "$lc" -gt "$now" ] 2>/dev/null; then lc=""; fi
 case "$cur" in
-  ''|'|||') : ;;
+  '') : ;;
+  '|||')
+    # No rate_limits in this render (older Claude Code before a session first request, or a
+    # plan without them). If this session has no tracker yet, write an EMPTY marker line
+    # "now|||now||": the session is then known, so its first rate_limits reading (which can only
+    # appear after a request) is a CHANGE stamped when it appears, not an unknown first sighting.
+    # A marker carries no reading, so the picker skips it and the reader prune ages it out.
+    if [ -n "$now" ] && [ ! -e "$rl_final" ]; then
+      rl_tmp="$dir/.telemetry-rl2-$sid.$$.tmp"
+      if { printf '%s|||%s||' "$now" "$now" > "$rl_tmp"; } 2>/dev/null; then
+        mv -f "$rl_tmp" "$rl_final" 2>/dev/null || rm -f "$rl_tmp" 2>/dev/null || true
+      fi
+    fi
+    ;;
   *)
-    if [ -n "$now" ]; then
+    # Something other than a regular file at the tracker path (a directory, a FIFO) is not ours
+    # to write through: skip tracking for this session rather than rename temps into it.
+    if [ -n "$now" ] && { [ ! -e "$rl_final" ] || [ -f "$rl_final" ]; }; then
       # Split THIS render's reading "5U|5R|7U|7R" into per-window pairs cur5="5U|5R" and
       # cur7="7U|7R" using pure parameter expansion (no extra process).
       cur_rest="${cur#*|}"; cur_5u="${cur%%|*}"; cur_5r="${cur_rest%%|*}"
@@ -229,15 +269,82 @@ case "$cur" in
         # Split the stored line on "|" into its 6 fields. `|| :` keeps the partial content on
         # a no-trailing-newline EOF (our writer emits no trailing newline). IFS is scoped to
         # this one `read` (a prefix assignment) so it does not leak.
-        IFS='|' read -r p1 p2 p3 p4 p5 p6 < "$rl_final" 2>/dev/null || :
+        # Wrapped so that a tracker removed between the test above and this open (a concurrent
+        # prune) cannot print the shell "cannot open" error: redirections apply left to right.
+        { IFS='|' read -r p1 p2 p3 p4 p5 p6 < "$rl_final"; } 2>/dev/null || :
       fi
       prev5="$p2|$p3"; prev7="$p5|$p6"
-      if [ "$have" -eq 0 ] || [ "$cur5" != "$prev5" ] || [ "$cur7" != "$prev7" ]; then
-        # Per-window TS: restamp only the window that changed; keep the other's stored TS.
-        if [ "$have" -eq 0 ] || [ "$cur5" != "$prev5" ]; then ts5="$now"; else ts5="$p1"; fi
-        if [ "$have" -eq 0 ] || [ "$cur7" != "$prev7" ]; then ts7="$now"; else ts7="$p4"; fi
-        rl_tmp="$dir/.telemetry-rl-$sid.$$.tmp"
-        if printf '%s|%s|%s|%s' "$ts5" "$cur5" "$ts7" "$cur7" > "$rl_tmp" 2>/dev/null; then
+      # Per-window TS = when that reading was MEASURED. A tracked session: the moment its pair
+      # CHANGED (restamp only the window whose pair differs; keep the other's stored TS). This
+      # sees every refresh, including ones from the session subagents, which do not move LC.
+      # A FIRST sighting (no tracker yet): the change moment is unknown, so use LC, the time of
+      # the session last API request, when the payload exposes it. Without it the measurement
+      # time is UNKNOWN and the stamp is 0: such a reading ranks below every reading with a known
+      # time (it can be old: an idle session, a new session carrying its process cached value)
+      # and takes a real stamp at its next change.
+      # Older Claude Code has no prompt_cache: on a first sighting (or a heal) only, never per
+      # render, read the tail of the session transcript and take the time of its last top-level
+      # assistant entry, the last API response written. Verified on the live pool (2026-11-01):
+      # it matches a full JSON parse on every reachable transcript; where prompt_cache also
+      # exists it lies within seconds after that request start (the entry is written when the
+      # response has streamed), so it dates the reading as the request it came from did.
+      # A stored stamp that is not a plain number, is longer than any epoch (12+ digits, beyond the
+      # shell integer range), or lies beyond the picker future bound (now + 60) is not a
+      # measurement time: that window is HEALED as if first sighted (below).
+      o1="$p1"; o4="$p4"; heal1=0; heal4=0
+      if [ "$have" -eq 1 ]; then
+        case "$p1" in ""|*[!0-9]*|????????????*) heal1=1 ;; *) [ "$p1" -gt $((now + 60)) ] 2>/dev/null && heal1=1 ;; esac
+        case "$p4" in ""|*[!0-9]*|????????????*) heal4=1 ;; *) [ "$p4" -gt $((now + 60)) ] 2>/dev/null && heal4=1 ;; esac
+      fi
+      first=0
+      if [ -n "$lc" ]; then first="$lc"
+      elif [ "$have" -eq 0 ] || [ "$heal1" -eq 1 ] || [ "$heal4" -eq 1 ]; then
+        tp="$(sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)"
+        if [ -n "$tp" ] && [ -f "$tp" ] && [ -r "$tp" ]; then
+          tx="$(tail -c 262144 "$tp" 2>/dev/null | LC_ALL=C awk '
+            function lastval(s, key,   p, q, r) {
+              r = ""
+              while ((p = index(s, key)) > 0) {
+                s = substr(s, p + length(key)); q = index(s, "\""); if (q > 0) r = substr(s, 1, q - 1)
+              }
+              return r
+            }
+            function epoch(iso,   y, mo, d, h, mi, se, yy, era, yoe, doy, doe) {
+              if (iso !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return ""
+              if (iso !~ /Z$/) return ""
+              y = substr(iso, 1, 4) + 0; mo = substr(iso, 6, 2) + 0; d = substr(iso, 9, 2) + 0
+              h = substr(iso, 12, 2) + 0; mi = substr(iso, 15, 2) + 0; se = substr(iso, 18, 2) + 0
+              yy = (mo <= 2) ? y - 1 : y
+              era = int(yy / 400); yoe = yy - era * 400
+              doy = int((153 * (mo + ((mo > 2) ? -3 : 9)) + 2) / 5) + d - 1
+              doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+              return sprintf("%.0f", (era * 146097 + doe - 719468) * 86400 + h * 3600 + mi * 60 + se)
+            }
+            lastval($0, "\"type\":\"") == "assistant" { t = lastval($0, "\"timestamp\":\"") }
+            END { if (t != "") printf "%s", epoch(t) }
+          ' 2>/dev/null)"
+          case "$tx" in
+            ""|*[!0-9]*) : ;;
+            *) if [ "$tx" -ge 1000000000 ] 2>/dev/null && [ "$tx" -le "$now" ] 2>/dev/null; then first="$tx"; fi ;;
+          esac
+        fi
+      fi
+      [ "$heal1" -eq 1 ] && p1="$first"
+      [ "$heal4" -eq 1 ] && p4="$first"
+      # A CHANGE is a new measurement, stamped now: rate_limits change only when an API response
+      # refreshes them. An unchanged reading keeps its stamp (a cancelled request returns no new
+      # numbers), and an unknown 0 stays 0 until the reading changes.
+      chg="$now"
+      if [ "$have" -eq 0 ] || [ "$cur5" != "$prev5" ]; then
+        if [ "$have" -eq 0 ]; then ts5="$first"; else ts5="$chg"; fi
+      else ts5="$p1"; fi
+      if [ "$have" -eq 0 ]; then ts7="$first"
+      elif [ "$cur7" != "$prev7" ]; then ts7="$chg"
+      else ts7="$p4"; fi
+      [ -n "$ts7" ] || ts7="$ts5"   # a corrupt line with no TS7 for an empty 7d pair
+      if [ "$have" -eq 0 ] || [ "$cur5" != "$prev5" ] || [ "$cur7" != "$prev7" ] || [ "$ts5" != "$o1" ] || [ "$ts7" != "$o4" ]; then
+        rl_tmp="$dir/.telemetry-rl2-$sid.$$.tmp"
+        if { printf '%s|%s|%s|%s' "$ts5" "$cur5" "$ts7" "$cur7" > "$rl_tmp"; } 2>/dev/null; then
           mv -f "$rl_tmp" "$rl_final" 2>/dev/null || rm -f "$rl_tmp" 2>/dev/null || true
         fi
       fi
@@ -245,36 +352,66 @@ case "$cur" in
     ;;
 esac
 
-# PHASE 3 pool: every session's change tracker (telemetry-rl-*) in this CCT_DIR. Same safe
+# PHASE 3 pool: every session's change tracker (telemetry-rl2-*) in this CCT_DIR. Same safe
 # glob + readable/regular-file filter as the old raw pool: a dir, dangling symlink, or
 # unreadable entry matching the glob is SKIPPED, never fatal (awk FATALs on a file it cannot
 # open, which would blank the whole segment). The list is CLEARED after the awk so CCT_WRAP
 # never inherits these paths as its argv.
-set -- "$dir"/telemetry-rl-*
-[ -e "$1" ] || set --
-n=$#
-while [ "$n" -gt 0 ]; do
-  f=$1; shift
-  [ -f "$f" ] && [ -r "$f" ] && set -- "$@" "$f"
-  n=$((n - 1))
-done
+# LINEAR: collect the kept paths in one newline-separated string and split it once (rebuilding
+# "$@" per file is quadratic in the pool size). Tracker names are sanitized to [A-Za-z0-9_-], so
+# only the DIRECTORY could contain a newline; in that unusual case the per-file "$@" build is
+# used instead. Globbing is off during the split.
+nl='
+'
+case "$dir" in
+  *"$nl"*)
+    set -- "$dir"/telemetry-rl2-*
+    [ -e "$1" ] || set --
+    n=$#
+    while [ "$n" -gt 0 ]; do
+      f=$1; shift
+      [ -f "$f" ] && [ -r "$f" ] && set -- "$@" "$f"
+      n=$((n - 1))
+    done
+    ;;
+  *)
+    list=""
+    for f in "$dir"/telemetry-rl2-*; do
+      [ -f "$f" ] && [ -r "$f" ] && list="$list$f$nl"
+    done
+    set -f; oifs=$IFS; IFS=$nl; set -- $list; IFS=$oifs; set +f
+    ;;
+esac
 
 # PHASE 3 awk. ctx + model + the per-session FALLBACK usage come from THIS render's payload
-# ($tmp, passed FIRST and identified by -v tmpf). 5h/7d come from the account-wide picker
+# ($tmp, the only awk input file). 5h/7d come from the account-wide picker
 # over the tracker pool: for EACH window independently, among tracker entries that HAVE that
 # window, whose resets_at is a plausible epoch (>=1e9, <1e11) and within the window horizon
-# (5h: <= now+21600 ; 7d: <= now+691200), take the best-ranked one (5h: resets_at then used;
-# 7d: resets_at, then the own-line five_hour resets_at as a freshness clock, then used - see
-# consider()). No valid entry (or now invalid) -> fall back to THIS session own usage with NO
-# countdown. LC_ALL=C makes awk byte-wise (the model-id whitelist strips all high/C1 bytes;
+# (5h: <= now+21600 ; 7d: <= now+691200), take the newest boundary and in it the most recently
+# measured reading (see consider()). No valid entry (or now invalid) -> fall back to THIS
+# session own usage with NO countdown.
+# LC_ALL=C makes awk byte-wise (the model-id whitelist strips all high/C1 bytes;
 # numbers use a "." decimal regardless of locale). countdown() is UNCHANGED.
-seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
-  function objspan(key,   p, i, n, depth, start, c) {
-    p = index(J, "\"" key "\"")
-    if (p == 0) return ""
-    n = length(J); i = p
-    while (i <= n && substr(J, i, 1) != "{") i++
-    if (i > n) return ""
+seg="$(CCT_OWN_RL="$rl_final" LC_ALL=C awk -v now="$now" -v segs="$segs" '
+  function objspan(key,   p, i, n, depth, start, c, off) {
+    # Find the first occurrence of the quoted key that IS a key (followed, after JSON whitespace,
+    # by a colon), skipping the same text used as a string VALUE (e.g. a session name). Then the
+    # value must BE an object: a null, number or string value (e.g. "five_hour": null) returns ""
+    # instead of scanning ahead into the NEXT object and reading the fields of a sibling as its
+    # own. Whitespace is space, tab and CR (LF never reaches J: awk joins the records without it),
+    # so CRLF or pretty-printed payloads parse; up(), resetsat() and modelid() allow the same.
+    n = length(J); off = 0
+    while (1) {
+      p = index(substr(J, off + 1), "\"" key "\"")
+      if (p == 0) return ""
+      p += off; i = p + length(key) + 2
+      while (i <= n && index(" \t\r", substr(J, i, 1)) > 0) i++
+      if (i <= n && substr(J, i, 1) == ":") break
+      off = p
+    }
+    i++
+    while (i <= n && index(" \t\r", substr(J, i, 1)) > 0) i++
+    if (i > n || substr(J, i, 1) != "{") return ""
     start = i; depth = 0
     while (i <= n) {
       c = substr(J, i, 1)
@@ -288,8 +425,8 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     t = objspan(key)
     if (t == "") return ""
     gsub(/\{[^{}]*\}/, "", t)
-    if (match(t, /"used_percentage"[ \t]*:[ \t]*[0-9]+(\.[0-9]+)?/) == 0) return ""
-    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", t); return t
+    if (match(t, /"used_percentage"[ \t\r]*:[ \t\r]*[0-9]+(\.[0-9]+)?/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH); sub(/.*:[ \t\r]*/, "", t); return t
   }
   function rnd(v) { if (v == "") return ""; return int(v + 0.5) }
   # The model id STRING from the model object. Unlike every other field this is display text,
@@ -298,8 +435,8 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
   function modelid(   t) {
     t = objspan("model")
     if (t == "") return ""
-    if (match(t, /"id"[ \t]*:[ \t]*"[^"]*"/) == 0) return ""
-    t = substr(t, RSTART, RLENGTH); sub(/.*"id"[ \t]*:[ \t]*"/, "", t); sub(/".*/, "", t)
+    if (match(t, /"id"[ \t\r]*:[ \t\r]*"[^"]*"/) == 0) return ""
+    t = substr(t, RSTART, RLENGTH); sub(/.*"id"[ \t\r]*:[ \t\r]*"/, "", t); sub(/".*/, "", t)
     gsub(/[^]A-Za-z0-9._[-]/, "", t)   # WHITELIST: only safe display chars survive
     return t
   }
@@ -328,70 +465,50 @@ seg="$(LC_ALL=C awk -v now="$now" -v tmpf="$tmp" -v segs="$segs" '
     if (sec < 86400) { h = int(sec/3600); m = int((sec%3600)/60); return (m == 0) ? ("~" h "h") : ("~" h "h" m "m") }
     d = int(sec/86400); h = int((sec%86400)/3600); return (h == 0) ? ("~" d "d") : ("~" d "d" h "h")
   }
-  # Rank one tracker entry into the per-window freshest. 5h: (resets_at DESC, used DESC). 7d:
-  # (resets_at DESC, then the SAME line five_hour resets_at as a freshness clock - cr - then
-  # used DESC). Guards: value present, resets_at a plausible epoch, reset in the FUTURE and
-  # within the window horizon (elapsed/corrupt/far-future readings can never win), and the
-  # change-TS not in the future (a corrupt/forward-clock tracker is dropped). See the block
-  # comment above for why the 7d rank needs the 5h clock: a mid-window quota reset makes
-  # "highest used% wins" pick the stalest reading, for days.
-  function consider(win, ts, u, rsat, cr,   r, t, cap, o) {
+  # Rank one tracker entry into the per-window freshest: (resets_at DESC, then stamp DESC).
+  # The newest boundary is the newest window. Within one boundary the most recently MEASURED
+  # reading wins (the stamp is its measurement time, see the block comment above), whatever the
+  # number is (a quota reset makes the newest reading the LOWER one, and it must win). Usage
+  # percentages are never compared. All stamps come from this machine clock, so they order
+  # consistently. An exact stamp tie (two readings changing in the same second, or several
+  # first sightings of unknown time, all 0) prefers THIS session own reading, else keeps the
+  # first entry in glob order: deterministic either way.
+  # Guards: value present, resets_at a plausible epoch, reset in the FUTURE and within the window
+  # horizon (elapsed, corrupt or far-future readings can never win), and the stamp not in the
+  # future (a corrupt tracker or a forward clock jump is dropped).
+  function consider(win, ts, u, rsat, mine,   r, t, cap) {
     if (u == "" || rsat == "") return
     r = rsat + 0
     if (r < 1e9 || r >= 1e11) return
     cap = (win == 5) ? 21600 : 691200
-    # resets_at must be in the FUTURE and within the window horizon: (now, now+cap]. A valid
-    # current reading always has a future reset boundary; a reset that already ELAPSED means
-    # that reading predates the last window reset (stale - the window has since reset), so
-    # exclude it even if its change-TS is recent (an anomalous session can restamp a fresh TS
-    # while still reporting an old, already-passed reset). This also stops the display from
-    # showing a misleading "~now" sourced from a stale reading.
+    # resets_at must be in the FUTURE and within the window horizon: (now, now+cap]. A reading
+    # whose reset already ELAPSED predates the last window reset, so it is stale whatever its
+    # stamp (a session re-rendering an ancient payload restamps it); this also keeps a
+    # misleading "~now" countdown off the bar.
     if (now != "" && (r <= now || r > now + cap)) return
     t = ts + 0
-    # The change-TS is no longer the ranking key, but a FUTURE TS still signals a corrupt
-    # tracker or a forward clock jump, so drop it (> now + 60s slack for same-machine render
-    # jitter). A tiny/non-numeric TS coerces low and is harmless.
     if (now != "" && t > now + 60) return
-    # 5h: newest window first (max resets_at), then within one window the later sample (max
-    # used). u/u5 are numeric-coerced for the compare (used_percentage can be a float).
-    if (win == 5) { if (!h5 || r > r5 || (r == r5 && u + 0 > u5 + 0)) { u5 = u; r5 = r; h5 = 1 }; return }
-    # 7d: newest window first, then the own-line 5h reset epoch as the freshness clock (o), then
-    # used. o = 0 marks an UNDATED line: a missing, non-numeric or sub-epoch 5h reset (the
-    # o < 1e9 test, which "" and garbage also fail), or one beyond the clock horizon, which is
-    # how a corrupt far-future epoch (including a 1e12 milliseconds misparse) is stopped from
-    # pinning the pick. Undated lines rank below every dated one and only tie among themselves,
-    # where the used% order decides, so an undated reading can still be shown when nothing better
-    # exists. The clock horizon is a DAY, deliberately far looser than the 5h window it dates: a
-    # real boundary is at most one window out (5h on every plan seen here, and a looser horizon
-    # is what keeps this honest if some plan uses a longer one), but the LOCAL clock can run slow
-    # (VM resume, bad NTP), and marking a genuinely FRESH reading undated is the worse error - it
-    # hands the pick to the stale readings that are still dated, which is the 24%-vs-96%
-    # inversion. A day tolerates about 19h of slow clock while still rejecting anything that is
-    # not a window boundary at all. The cost, stated plainly: values in (now+21600, now+86400]
-    # are refused as a 5h BOUNDARY by the 5h picker above yet accepted here as a CLOCK, and since
-    # the clock tier is a maximum, one such line outranks every genuine reading on its boundary.
-    # A slow clock does put GENUINE lines in that band (that is the case this tolerance exists
-    # for), but it shifts every line equally, so it cannot invert an ordering; only a corrupt or
-    # foreign line lands there while the others do not, and that is the one way the band can rank
-    # something wrongly. This tolerance applies to the 7d RANK only: the 5h pick above keeps the
-    # 21600 cap, because that cap also bounds what the 5h countdown may display, so under a slow
-    # clock the 5h segment can still show a stale reading (a 5h window self-heals within 5h; a 7d
-    # one does not, which is why only the 7d rank is widened).
-    # (The now != "" test is defensive only: with no valid now the END block discards the pick.)
-    o = cr + 0
-    if (o < 1e9 || (now != "" && o > now + 86400)) o = 0
-    if (!h7 || r > r7 || (r == r7 && (o > o7 || (o == o7 && u + 0 > u7 + 0)))) {
-      u7 = u; r7 = r; o7 = o; h7 = 1
-    }
+    if (win == 5) { if (!h5 || r > r5 || (r == r5 && (t > t5 || (t == t5 && mine)))) { u5 = u; r5 = r; t5 = t; h5 = 1 }; return }
+    if (!h7 || r > r7 || (r == r7 && (t > t7 || (t == t7 && mine)))) { u7 = u; r7 = r; t7 = t; h7 = 1 }
   }
   # Tracker files are single-line "TS5|5U|5R|TS7|7U|7R" with a per-window change TS; parse the
   # FIRST line of each. THIS render payload ($tmp) is JSON, accumulated into J for the
-  # per-session values instead. An old 5-field line self-migrates (see the writer): read here
-  # its a[6] is empty, so its 7d reading (a[5], a[6]) has an empty resets_at and consider()
-  # rejects it - an old-format stale 7d can never win in the interim before the rewrite.
-  FNR == 1 && FILENAME != tmpf { split($0, a, "|"); consider(5, a[1], a[2], a[3]); consider(7, a[4], a[5], a[6], a[3]) }
-  FILENAME == tmpf { J = J $0 }
+  # per-session values instead. A malformed line (too few fields) yields an empty value or
+  # resets_at that consider() rejects.
+  # The pool files are read with getline in END, not as awk input files: a tracker deleted
+  # between the shell scan and this read (a concurrent prune) then just returns -1 and is
+  # skipped, where an input file that cannot be opened is FATAL and would blank the bar.
+  # own (this session tracker path) comes through ENVIRON, which unlike -v applies no escape
+  # processing, so a CCT_DIR containing a backslash still matches.
+  BEGIN { own = ENVIRON["CCT_OWN_RL"]; for (i = 2; i < ARGC; i++) { pool[++np] = ARGV[i]; delete ARGV[i] } }
+  { J = J $0 }
   END {
+    for (i = 1; i <= np; i++) {
+      if ((getline line < pool[i]) > 0) {
+        split(line, a, "|"); consider(5, a[1], a[2], a[3], pool[i] == own); consider(7, a[4], a[5], a[6], pool[i] == own)
+      }
+      close(pool[i])
+    }
     ctx = rnd(up("context_window")); f5 = rnd(up("five_hour")); f7 = rnd(up("seven_day"))
     # Cross-session ranked value only when now is known (else the horizon guard is off) - else
     # fall back to THIS session own usage with no countdown.

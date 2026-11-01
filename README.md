@@ -117,16 +117,23 @@ per-session file your hooks can read.
 
 `ctx` is per session. The 5h/7d rate limits are account-wide but Claude Code only refreshes
 them on an API call, so any single session's view is often stale. The bar therefore shows, per
-window, the freshest reading it can identify across your open sessions ON THIS MACHINE. Each
-session records its own reading, and the bar ranks them: newest reset boundary first, then -
-for 7d - the reading's own 5h reset boundary, which dates it (both windows come from the same
-payload, and successive 5h windows are at least five hours apart, so a later 5h boundary means
-a later measurement), and only then usage. That dating is what stops a pre-reset reading from
-sticking around when your quota resets without its boundary moving, from the moment any session
-records a reading in a later 5h window. A reading whose own reset
-boundary already elapsed is treated as stale and never picked; if no session has a current
-reading for a window, the bar falls back to this session's last-known usage with no countdown.
-So your open sessions agree instead of showing different stale numbers. It does not converge
+window, the most recent reading across your open sessions ON THIS MACHINE. Each session records
+its own reading and when it was measured: the moment the reading changed (a reading only
+changes when an API response refreshes it, including responses to subagents), or, the first
+time a session is seen, the time of its last API call when newer Claude Code exposes it
+(`prompt_cache`), so a long-idle session keeps its real, old time (older Claude Code lacks that
+field, so the time of the last response in the session transcript is used, except for a
+Windows-style transcript path, which is not read; without either, its time is unknown and it
+ranks below every reading with a known time until its number changes). The bar takes the newest
+reset boundary, and in it the most recently measured reading, whatever its number: after a
+quota reset the newest reading is the lower one, and it is shown as soon as any session makes a
+request. Usage percentages are never compared. Plans without a 5-hour limit carry only the 7d
+window and work the same way; once no session has a current 5h reading and this session's own
+payload has no 5h window, the 5h segment is left out. A reading whose own reset boundary
+already elapsed is treated as stale and never picked; if no session has a current reading for a
+window, the bar falls back to this session's last-known usage with no countdown. So your open
+sessions show the newest reading instead of different stale numbers (if several readings have
+no known time at all, each session shows its own). It does not converge
 across separate machines.
 
 One job, three pieces:
@@ -218,9 +225,12 @@ The pure-shell entry writes the RAW Claude Code statusline payload, verbatim, at
 `<dir>/telemetry-raw-<session>.json`. It is overwritten each render (atomically, via a
 temp file + rename), so a single session never grows the directory. When the payload
 carries `rate_limits` it also writes a second, tiny per-session file,
-`<dir>/telemetry-rl-<session>` (one line, no extension), holding that session's last
-5h/7d reading and when each window last changed. That is what lets the bar compare your
-open sessions and show the freshest reading; nothing else reads it.
+`<dir>/telemetry-rl2-<session>` (one line, no extension), holding that session's last
+5h/7d reading and when each was measured (a session seen before it has any rate limits gets an
+empty marker file, so its first reading is dated when it appears). That is what lets the bar
+compare your open sessions and show the freshest reading; nothing else reads it. Versions
+before 1.4.8 named it `telemetry-rl-<session>`; those files are never read and are deleted by
+the prune below.
 `readTelemetry(sessionId)` parses the raw file on demand. The raw payload
 looks like (fields vary by plan/model/version - the lib reads them straight, never
 assuming a shape):
@@ -259,10 +269,15 @@ but a long-lived machine sees a new session id (UUID) per `claude` run. So
 `readTelemetry` prunes off the hot path (throttled, at most once per
 `CCT_PRUNE_EVERY_SEC`, default hourly): it deletes raw files older than
 `CCT_PRUNE_AGE_SEC` (default 1 day) and then caps the total at `CCT_PRUNE_MAX_FILES`
-(default 200, deleting the oldest beyond the cap). The same two rules are applied
-independently to the `telemetry-rl-*` files. It only ever touches this lib's own
-`telemetry-raw-*.json` and `telemetry-rl-*` files (and its own leftover write temps),
-never anything else in the directory. Pruning is best-effort and never throws.
+(default 200, deleting the oldest beyond the cap). A `telemetry-rl2-*` tracker is deleted
+once every reset boundary in it has passed (one it cannot parse goes by the same age rule):
+an idle session's tracker keeps the time its reading was measured, which the bar relies on
+(trackers are capped separately at `CCT_PRUNE_MAX_RL`, default 200). Pruning only runs when
+something calls `readTelemetry`; without a hook nothing is deleted, and the bar ignores
+trackers whose windows have ended. Pre-1.4.8 `telemetry-rl-*` trackers are deleted outright.
+It only ever touches this lib's own `telemetry-raw-*.json`, `telemetry-rl2-<id>` and
+`telemetry-rl-<id>` files (and its own leftover write temps), never anything else in the
+directory. Pruning is best-effort and never throws.
 
 ## Environment variables
 
@@ -284,6 +299,8 @@ never anything else in the directory. Pruning is best-effort and never throws.
   86400, 1 day).
 - `CCT_PRUNE_MAX_FILES` - hard cap on raw files; the oldest beyond it are deleted
   (default 200).
+- `CCT_PRUNE_MAX_RL` - hard cap on `telemetry-rl2-*` trackers; the oldest beyond it are
+  deleted (default 200).
 - `CCT_PRUNE_EVERY_SEC` - throttle: prune at most once per this interval across reader
   invocations (default 3600, hourly).
 

@@ -1,6 +1,6 @@
 {
   "name": "cc-context-telemetry",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "description": "A Claude Code statusLine wrapper that bridges context % and usage limits to your hooks and plugins, while keeping your existing bar.",
   "main": "index.js",
   "bin": {
